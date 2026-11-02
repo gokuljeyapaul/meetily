@@ -1,0 +1,117 @@
+{
+  "reasons": {
+    "committed->raw_expired": "the raw media reached its thirty-day expiry",
+    "committed->raw_revoked": "the coachee revoked consent for the raw media",
+    "committed->severed": "the coachee's identity was severed while the raw media was live",
+    "paused->discarded": "the capture can never be processed, so it never enters the pipeline",
+    "paused->recording": "both parties consented again after the pause",
+    "paused->uploading": "the session ended while paused; what was captured still uploads",
+    "processing->aborted": "consent was withdrawn mid-run, so the run is discarded",
+    "processing->committed": "the run committed atomically",
+    "queued->discarded": "the capture can never be processed, so it never enters the pipeline",
+    "queued->processing": "the consent gate passed at the processing checkpoint",
+    "raw_expired->severed": "the coachee's identity was severed after expiry",
+    "raw_revoked->severed": "the coachee's identity was severed after revocation",
+    "recording->discarded": "the capture can never be processed, so it never enters the pipeline",
+    "recording->paused": "a third party joined, or either party stopped the recording",
+    "recording->uploading": "the session ended",
+    "uploading->discarded": "the capture can never be processed, so it never enters the pipeline",
+    "uploading->queued": "the ciphertext is stored and the server verified its digest"
+  },
+  "refusals_to_start": {
+    "chain_broken": "The consent record for this engagement does not verify, so it cannot be relied on, and nothing has been recorded.",
+    "clock_skew": "This device's clock disagrees with the consent record's, so timings cannot be trusted, and nothing has been recorded.",
+    "ledger_unreachable": "Darpana could not reach the consent record, so it cannot confirm that consent is live, and nothing has been recorded.",
+    "no_engagement": "There is no engagement on file for this session, so nothing may be recorded, uploaded or analysed.",
+    "not_signed": "All three parties have not yet signed the current agreement, so nothing may be recorded until they have.",
+    "policy_missing": "The version of the agreement this engagement signed is not available, so its terms cannot be read, and nothing has been recorded.",
+    "reconsent_pending": "The agreement has changed and is waiting to be signed again, so this engagement is paused and nothing is being processed.",
+    "revoked": "Consent for this engagement has been withdrawn, so the recording may no longer be used and nothing further will be processed.",
+    "scope_not_granted": "This engagement did not grant permission for this kind of processing, so it will not be carried out.",
+    "severed": "This engagement has been severed at the coachee's request, so no recording may be made or used under it.",
+    "signature_unverifiable": "A signature on the consent record cannot be verified, so consent cannot be relied on, and nothing has been recorded."
+  },
+  "states": [
+    "recording",
+    "paused",
+    "uploading",
+    "queued",
+    "processing",
+    "committed",
+    "aborted",
+    "discarded",
+    "raw_expired",
+    "raw_revoked",
+    "severed"
+  ],
+  "transitions": [
+    [
+      "recording",
+      "paused"
+    ],
+    [
+      "paused",
+      "recording"
+    ],
+    [
+      "recording",
+      "uploading"
+    ],
+    [
+      "paused",
+      "uploading"
+    ],
+    [
+      "uploading",
+      "queued"
+    ],
+    [
+      "queued",
+      "processing"
+    ],
+    [
+      "processing",
+      "committed"
+    ],
+    [
+      "processing",
+      "aborted"
+    ],
+    [
+      "committed",
+      "raw_expired"
+    ],
+    [
+      "committed",
+      "raw_revoked"
+    ],
+    [
+      "raw_expired",
+      "severed"
+    ],
+    [
+      "raw_revoked",
+      "severed"
+    ],
+    [
+      "committed",
+      "severed"
+    ],
+    [
+      "recording",
+      "discarded"
+    ],
+    [
+      "paused",
+      "discarded"
+    ],
+    [
+      "uploading",
+      "discarded"
+    ],
+    [
+      "queued",
+      "discarded"
+    ]
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "missed_poll_limit": 1,
+  "pause_within_ms": 5000,
+  "sentences": {
+    "pause": "Recording paused: a third person is in the call, or Darpana could not confirm who is, and the agreement covers two people. Both of you need to agree again before recording continues.",
+    "record": "Both people on the agreement are in the call, so recording continues.",
+    "refuse": "Recording cannot start: this platform does not tell Darpana who is in the call, so it cannot tell whether anyone beyond the two of you is listening. Use a platform that lists participants."
+  }
+}
