@@ -88,8 +88,8 @@ pub struct EchoMeasurement {
 impl EchoMeasurement {
     /// True when the output device is audible in the microphone.
     pub fn is_echoing(&self) -> bool {
-    unimplemented!("I2-E1-S1-T3: the echo gate is not built yet")
-}
+        self.excess_db >= ECHO_MARGIN_DB
+    }
 }
 
 /// The gate's answer.
@@ -116,8 +116,14 @@ impl EchoVerdict {
     /// The sentence shown to the coach when the gate refuses. The wording
     /// belongs to the engine (see `refusals`), not to this module.
     pub fn refusal_sentence(&self) -> Option<String> {
-    unimplemented!("I2-E1-S1-T3: the echo gate is not built yet")
-}
+        match self {
+            EchoVerdict::Clear(_) => None,
+            EchoVerdict::OutputHeardInMicrophone(m) => Some(format!(
+                "{} ({}: the test tone came back {:.0} dB above this room's floor)",
+                refusals::ECHO_HEARD_IN_MICROPHONE, m.output_device, m.excess_db
+            )),
+        }
+    }
 }
 
 /// What the recording lifecycle must do after a mid-session re-test.
@@ -131,7 +137,13 @@ pub enum GateAction {
 
 /// The probe tone itself: `PROBE_DURATION_MS` of a sine at `PROBE_TONE_HZ`.
 pub fn probe_signal(sample_rate: u32) -> Vec<f32> {
-    unimplemented!("I2-E1-S1-T3: the echo gate is not built yet")
+    let count = (sample_rate as u64 * PROBE_DURATION_MS / 1_000) as usize;
+    (0..count)
+        .map(|n| {
+            let t = n as f32 / sample_rate as f32;
+            PROBE_AMPLITUDE * (TAU * PROBE_TONE_HZ * t).sin()
+        })
+        .collect()
 }
 
 /// How many samples each measurement block covers. The level is averaged over
@@ -148,11 +160,58 @@ const MEASUREMENT_BLOCK: usize = 1_024;
 /// being asked about, and measuring the probe's own frequency is what keeps a
 /// noisy room from reading as an echo.
 pub fn tone_level_dbfs(samples: &[f32], sample_rate: u32, frequency: f32) -> f32 {
-    unimplemented!("I2-E1-S1-T3: the echo gate is not built yet")
+    if samples.is_empty() {
+        return f32::NEG_INFINITY;
+    }
+
+    let block = MEASUREMENT_BLOCK.min(samples.len());
+    let blocks: Vec<&[f32]> = samples.chunks_exact(block).collect();
+    if blocks.len() > 1 {
+        let mean_power: f32 = blocks
+            .iter()
+            .map(|b| {
+                let dbfs = block_level_dbfs(b, sample_rate, frequency);
+                if dbfs.is_finite() {
+                    10f32.powf(dbfs / 10.0)
+                } else {
+                    0.0
+                }
+            })
+            .sum::<f32>()
+            / blocks.len() as f32;
+        return if mean_power > 0.0 {
+            10.0 * mean_power.log10()
+        } else {
+            f32::NEG_INFINITY
+        };
+    }
+
+    block_level_dbfs(samples, sample_rate, frequency)
 }
 
 fn block_level_dbfs(samples: &[f32], sample_rate: u32, frequency: f32) -> f32 {
-    unimplemented!("I2-E1-S1-T3: the echo gate is not built yet")
+    if samples.is_empty() {
+        return f32::NEG_INFINITY;
+    }
+
+    let omega = TAU * frequency / sample_rate as f32;
+    let coefficient = 2.0 * omega.cos();
+    let (mut s_prev, mut s_prev2) = (0.0f32, 0.0f32);
+    for &sample in samples {
+        let s = sample + coefficient * s_prev - s_prev2;
+        s_prev2 = s_prev;
+        s_prev = s;
+    }
+
+    let power = s_prev * s_prev + s_prev2 * s_prev2 - coefficient * s_prev * s_prev2;
+    // Back to an amplitude comparable with full scale: the Goertzel sums over
+    // every sample, so divide the magnitude by half the window length.
+    let amplitude = power.max(0.0).sqrt() / (samples.len() as f32 / 2.0);
+    if amplitude <= 0.0 {
+        f32::NEG_INFINITY
+    } else {
+        20.0 * amplitude.log10()
+    }
 }
 
 /// Run the echo test once against whatever the player is driving.
@@ -160,7 +219,40 @@ pub fn run_echo_test<P: ProbePlayer + ?Sized>(
     player: &mut P,
     sample_rate: u32,
 ) -> Result<EchoVerdict> {
-    unimplemented!("I2-E1-S1-T3: the echo gate is not built yet")
+    let output_device = player.output_device_name();
+    let probe = probe_signal(sample_rate);
+
+    // A device that cannot be driven is a refusal: there is no measurement to
+    // pass, and defaulting to "probably fine" is how coachee audio ends up on
+    // the coach's track.
+    let capture = player.play_probe(&probe, sample_rate).map_err(|e| {
+        anyhow!(
+            "{} ({output_device}: {e})",
+            refusals::ECHO_TEST_COULD_NOT_RUN
+        )
+    })?;
+
+    if capture.during_probe.is_empty() {
+        return Err(anyhow!(
+            "{} ({output_device}: the microphone returned no samples during the probe)",
+            refusals::ECHO_TEST_COULD_NOT_RUN
+        ));
+    }
+
+    let floor_dbfs = tone_level_dbfs(&capture.floor, sample_rate, PROBE_TONE_HZ);
+    let probe_dbfs = tone_level_dbfs(&capture.during_probe, sample_rate, PROBE_TONE_HZ);
+    let measurement = EchoMeasurement {
+        output_device,
+        floor_dbfs,
+        probe_dbfs,
+        excess_db: probe_dbfs - floor_dbfs,
+    };
+
+    Ok(if measurement.is_echoing() {
+        EchoVerdict::OutputHeardInMicrophone(measurement)
+    } else {
+        EchoVerdict::Clear(measurement)
+    })
 }
 
 /// The gate across a session: the verdict that let recording start, and the
@@ -175,8 +267,18 @@ pub struct EchoGate {
 impl EchoGate {
     /// Run the test before recording starts. `Err` means do not record.
     pub fn open<P: ProbePlayer + ?Sized>(player: &mut P, sample_rate: u32) -> Result<Self> {
-    unimplemented!("I2-E1-S1-T3: the echo gate is not built yet")
-}
+        let verdict = run_echo_test(player, sample_rate)?;
+        match verdict {
+            EchoVerdict::Clear(measurement) => Ok(Self {
+                sample_rate,
+                tested_output_device: measurement.output_device.clone(),
+                last_measurement: measurement,
+            }),
+            EchoVerdict::OutputHeardInMicrophone(_) => Err(anyhow!(verdict
+                .refusal_sentence()
+                .expect("a refusing verdict has a sentence"))),
+        }
+    }
 
     pub fn tested_output_device(&self) -> &str {
         &self.tested_output_device
@@ -192,8 +294,25 @@ impl EchoGate {
         &mut self,
         player: &mut P,
     ) -> Result<GateAction> {
-    unimplemented!("I2-E1-S1-T3: the echo gate is not built yet")
-}
+        if player.output_device_name() == self.tested_output_device {
+            return Ok(GateAction::Continue);
+        }
+
+        match run_echo_test(player, self.sample_rate) {
+            Ok(verdict) => {
+                let measurement = verdict.measurement().clone();
+                self.tested_output_device = measurement.output_device.clone();
+                self.last_measurement = measurement;
+                Ok(match verdict.refusal_sentence() {
+                    Some(sentence) => GateAction::Pause(sentence),
+                    None => GateAction::Continue,
+                })
+            }
+            // The new device cannot be driven, so nothing can be measured on
+            // it: pause rather than carry on under the old device's verdict.
+            Err(e) => Ok(GateAction::Pause(e.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
