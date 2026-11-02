@@ -49,8 +49,18 @@ dead code that touches audio is the kind that gets switched back on.
 ## Building this fork
 
 Upstream's instructions apply (`docs/BUILDING.md`, `frontend/clean_run.sh`,
-`frontend/clean_run_windows.bat`). One known obstacle, not introduced by us: on
-a non-macOS machine `cargo check` still resolves the macOS-only
-`cidre` git dependency pinned at `rev = "a9587fa"` and fails with
-`no matching package named cidre found`, so the Rust crate cannot be type-checked
-from Linux at all. Rust changes here are verified on macOS and Windows.
+`frontend/clean_run_windows.bat`).
+
+Linux can type-check and run the test suite, which earlier notes in this file
+denied: the macOS-only `cidre` dependency pinned at `rev = "a9587fa"` fails to
+resolve on cargo 1.83 (`no matching package named cidre found`) but resolves on
+1.99, so the obstacle was the toolchain rather than the platform. With
+`pkg-config libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev
+libjavascriptcoregtk-4.1-dev libasound2-dev libssl-dev cmake clang` installed,
+`cargo check --locked --all-targets` and `cargo test --locked` both pass from
+Linux.
+
+What Linux still cannot do: compile the macOS and Windows capture paths
+(ScreenCaptureKit, WASAPI loopback), which only their own platforms build, and
+exercise real audio devices. Those stay with CI's macOS and Windows jobs and,
+for device behaviour, a real machine.

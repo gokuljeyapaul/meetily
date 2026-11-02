@@ -110,12 +110,6 @@ impl SettingsRepository {
         pool: &SqlitePool,
         provider: &str,
     ) -> std::result::Result<Option<String>, sqlx::Error> {
-        // Custom OpenAI uses JSON config - extract API key from there
-        if provider == "custom-openai" {
-            let config = Self::get_custom_openai_config(pool).await?;
-            return Ok(config.and_then(|c| c.api_key));
-        }
-
         let api_key_column = match provider {
             "openai" => "openaiApiKey",
             "ollama" => "ollamaApiKey",
