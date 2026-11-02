@@ -1,0 +1,5 @@
+{
+  "device_is_pre_mixed": "Recording stopped: the selected device already mixes both sides of the call into one signal, so the two voices could never be separated or deleted again. Choose your microphone and your system audio as separate devices.",
+  "echo_heard_in_microphone": "Recording stopped: your speakers can be heard in your microphone, so the other person's voice would be recorded onto your track and could not be separated or deleted later. Put on headphones and start again.",
+  "echo_test_could_not_run": "Recording stopped: the echo test could not be run on your output device, so there is no evidence your microphone is free of the other person's voice."
+}
