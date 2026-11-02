@@ -26,6 +26,8 @@ pub mod recording_saver;
 pub mod two_track;  // Darpana: coach and coachee tracks written unmixed
 pub mod echo_gate;
 pub mod echo_probe_device;  // Darpana: the gate's probe on real devices  // Darpana: refuse to record when the speakers reach the mic
+pub mod sealed_capture;  // Darpana: frames sealed as they are written
+pub mod sealed_upload;  // Darpana: resumable upload and crash recovery
 pub mod session_lifecycle;  // Darpana: the engine's state table, vendored
 pub mod roster;  // Darpana: the fail-closed roster policy, vendored
 pub mod refusals;  // Darpana: the engine's refusal wording, vendored
