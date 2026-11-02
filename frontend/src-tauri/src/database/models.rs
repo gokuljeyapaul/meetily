@@ -99,12 +99,6 @@ pub struct Setting {
 }
 
 impl Setting {
-    /// Parse the custom OpenAI config from JSON string
-    pub fn get_custom_openai_config(&self) -> Option<crate::summary::CustomOpenAIConfig> {
-        self.custom_openai_config.as_ref().and_then(|json| {
-            serde_json::from_str(json).ok()
-        })
-    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

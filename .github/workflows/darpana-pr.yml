@@ -40,21 +40,21 @@ jobs:
       - name: Install cmake (macOS)
         if: runner.os == 'macOS'
         run: brew install cmake
-      # `tauri.conf.json` lists `binaries/llama-helper` as an external binary,
-      # and the build script refuses to run without it — it is the local LLM
-      # sidecar that only summarisation uses, built by upstream's
-      # `build-gpu`/`clean_build` scripts. A stub satisfies the resource check
-      # for a type-check, and this step goes away with the summarisation
-      # deletion, which removes the sidecar from the config entirely.
-      - name: Stub the llama-helper sidecar
+      # `tauri.conf.json` still lists `binaries/ffmpeg` as a sidecar (audio,
+      # not summarisation), and the build script refuses to run without the
+      # target-triple-suffixed file, which upstream's build scripts download.
+      # A stub satisfies the resource check for a type-check; nothing in CI
+      # executes it. The llama-helper stub that used to sit here is gone with
+      # the summarisation deletion.
+      - name: Stub the ffmpeg sidecar
         shell: bash
         run: |
           triple="$(rustc -vV | sed -n 's/^host: //p')"
           ext=""
           [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
           mkdir -p frontend/src-tauri/binaries
-          printf '#!/bin/sh\nexit 0\n' > "frontend/src-tauri/binaries/llama-helper-${triple}${ext}"
-          chmod +x "frontend/src-tauri/binaries/llama-helper-${triple}${ext}"
+          printf '#!/bin/sh\nexit 0\n' > "frontend/src-tauri/binaries/ffmpeg-${triple}${ext}"
+          chmod +x "frontend/src-tauri/binaries/ffmpeg-${triple}${ext}"
       # No `cargo fmt --check`: upstream's tree is not rustfmt-clean, and
       # reformatting it would turn every future upstream merge into a conflict
       # in files we never touched. Formatting is reviewed per diff instead.
@@ -110,8 +110,26 @@ jobs:
       - uses: actions/checkout@v4
       - name: Rust and UI carry no summarisation path
         run: |
-          if [ -d frontend/src-tauri/src/summary ]; then
-            echo "frontend/src-tauri/src/summary still exists"
-            echo "(expected until the deletion commit; this check enforces it afterwards)"
+          fail=0
+          for path in \
+            frontend/src-tauri/src/summary \
+            frontend/src-tauri/src/ollama \
+            frontend/src-tauri/src/anthropic \
+            frontend/src-tauri/src/groq \
+            frontend/src-tauri/src/openai \
+            frontend/src-tauri/src/openrouter \
+            llama-helper
+          do
+            if [ -e "$path" ]; then
+              echo "::error::$path is back: summarisation was deleted from this fork (FORK.md)"
+              fail=1
+            fi
+          done
+          # An upstream merge that reintroduces a call is the real risk, not a
+          # directory reappearing, so the symbols are checked too.
+          if grep -rnE "summary_engine|CustomOpenAIConfig|llama-helper" \
+               frontend/src-tauri/src frontend/src-tauri/tauri.conf.json; then
+            echo "::error::a summarisation symbol is referenced again"
+            fail=1
           fi
-          exit 0
+          exit $fail
