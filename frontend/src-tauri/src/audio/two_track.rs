@@ -16,11 +16,13 @@
 //! diarisation or source-separation step to fall back on, because a mixed file
 //! is not something to be repaired later.
 
+use std::fs::File;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
+use log::info;
 
-#[allow(unused_imports)]
 use super::recording_state::{AudioChunk, DeviceType};
 
 /// The alignment tolerance, in samples at the capture rate: the two devices run
@@ -42,8 +44,73 @@ const PRE_MIXED_DEVICE_MARKERS: &[&str] = &[
 ];
 
 /// Refuse a device whose own name says it is already a mix of both sources.
-pub fn check_device_is_single_source(_role: &str, _device_name: &str) -> Result<()> {
-    unimplemented!("two-track capture is not implemented yet")
+pub fn check_device_is_single_source(role: &str, device_name: &str) -> Result<()> {
+    let lowered = device_name.to_lowercase();
+    if let Some(marker) = PRE_MIXED_DEVICE_MARKERS
+        .iter()
+        .find(|marker| lowered.contains(*marker))
+    {
+        return Err(anyhow!(
+            "refusing to record: the {role} device \"{device_name}\" is a pre-mixed endpoint \
+             (matched \"{marker}\"), so the coach and coachee would share one track and \
+             coachee audio could never be deleted again"
+        ));
+    }
+    Ok(())
+}
+
+/// One track: one device, one file, its own sample clock.
+#[derive(Debug)]
+struct TrackWriter {
+    path: PathBuf,
+    file: BufWriter<File>,
+    device_name: String,
+    samples_written: u64,
+}
+
+impl TrackWriter {
+    fn create(path: PathBuf, device_name: String, sample_rate: u32) -> Result<Self> {
+        let mut file = BufWriter::new(File::create(&path)?);
+        write_wav_header(&mut file, sample_rate, 0)?;
+        Ok(Self {
+            path,
+            file,
+            device_name,
+            samples_written: 0,
+        })
+    }
+
+    fn write(&mut self, samples: &[f32]) -> Result<()> {
+        for sample in samples {
+            let clamped = sample.clamp(-1.0, 1.0);
+            let pcm = (clamped * i16::MAX as f32) as i16;
+            self.file.write_all(&pcm.to_le_bytes())?;
+        }
+        self.samples_written += samples.len() as u64;
+        Ok(())
+    }
+
+    fn pad_silence(&mut self, samples: u64) -> Result<()> {
+        let silence = [0u8; 2];
+        for _ in 0..samples {
+            self.file.write_all(&silence)?;
+        }
+        self.samples_written += samples;
+        Ok(())
+    }
+
+    fn finalize(mut self, sample_rate: u32) -> Result<TrackResult> {
+        self.file.flush()?;
+        let mut file = self.file.into_inner()?;
+        file.seek(SeekFrom::Start(0))?;
+        write_wav_header(&mut file, sample_rate, self.samples_written)?;
+        file.flush()?;
+        Ok(TrackResult {
+            path: self.path,
+            device_name: self.device_name,
+            samples: self.samples_written,
+        })
+    }
 }
 
 /// What one finished track is, for the metadata the engine reads.
@@ -63,40 +130,113 @@ pub struct TwoTrackResult {
 }
 
 impl TwoTrackResult {
-    pub fn duration_seconds(_track: &TrackResult, _sample_rate: u32) -> f64 {
-        unimplemented!("two-track capture is not implemented yet")
+    pub fn duration_seconds(track: &TrackResult, sample_rate: u32) -> f64 {
+        track.samples as f64 / sample_rate as f64
     }
 }
 
 /// Routes each chunk to the file belonging to the device that produced it.
 #[derive(Debug)]
-pub struct TwoTrackRecorder;
+pub struct TwoTrackRecorder {
+    coach: TrackWriter,
+    coachee: TrackWriter,
+    sample_rate: u32,
+}
 
 impl TwoTrackRecorder {
+    /// `mic_device` and `system_device` are the identifiers the capture layer
+    /// resolved; both are recorded with their track and both are refused if
+    /// they name a pre-mixed endpoint.
     pub fn new(
-        _meeting_folder: &Path,
-        _sample_rate: u32,
-        _mic_device: &str,
-        _system_device: &str,
+        meeting_folder: &Path,
+        sample_rate: u32,
+        mic_device: &str,
+        system_device: &str,
     ) -> Result<Self> {
-        unimplemented!("two-track capture is not implemented yet")
+        check_device_is_single_source("microphone", mic_device)?;
+        check_device_is_single_source("system-audio", system_device)?;
+
+        let coach = TrackWriter::create(
+            meeting_folder.join("coach.wav"),
+            mic_device.to_string(),
+            sample_rate,
+        )?;
+        let coachee = TrackWriter::create(
+            meeting_folder.join("coachee.wav"),
+            system_device.to_string(),
+            sample_rate,
+        )?;
+
+        info!(
+            "Recording two unmixed tracks: coach.wav from \"{}\", coachee.wav from \"{}\"",
+            mic_device, system_device
+        );
+
+        Ok(Self {
+            coach,
+            coachee,
+            sample_rate,
+        })
     }
 
-    pub fn write_chunk(&mut self, _chunk: &AudioChunk) -> Result<()> {
-        unimplemented!("two-track capture is not implemented yet")
+    /// The chunk's own `device_type` decides its file. There is deliberately no
+    /// branch that writes a chunk to both files or to a combined one.
+    pub fn write_chunk(&mut self, chunk: &AudioChunk) -> Result<()> {
+        match chunk.device_type {
+            DeviceType::Microphone => self.coach.write(&chunk.data),
+            DeviceType::System => self.coachee.write(&chunk.data),
+        }
     }
 
     pub fn coach_samples(&self) -> u64 {
-        unimplemented!("two-track capture is not implemented yet")
+        self.coach.samples_written
     }
 
     pub fn coachee_samples(&self) -> u64 {
-        unimplemented!("two-track capture is not implemented yet")
+        self.coachee.samples_written
     }
 
-    pub fn finish(self) -> Result<TwoTrackResult> {
-        unimplemented!("two-track capture is not implemented yet")
+    /// Close both files. The devices' clocks drift, so the shorter track is
+    /// padded with silence to match the longer one: the two durations then
+    /// agree within a frame without either track borrowing the other's audio.
+    pub fn finish(mut self) -> Result<TwoTrackResult> {
+        let coach = self.coach.samples_written;
+        let coachee = self.coachee.samples_written;
+        if coach > coachee {
+            self.coachee.pad_silence(coach - coachee)?;
+        } else if coachee > coach {
+            self.coach.pad_silence(coachee - coach)?;
+        }
+
+        let sample_rate = self.sample_rate;
+        Ok(TwoTrackResult {
+            coach: self.coach.finalize(sample_rate)?,
+            coachee: self.coachee.finalize(sample_rate)?,
+            sample_rate,
+        })
     }
+}
+
+/// 16-bit mono PCM header. Written once with a zero length, then rewritten with
+/// the real one when the track closes.
+fn write_wav_header<W: Write>(writer: &mut W, sample_rate: u32, samples: u64) -> Result<()> {
+    let data_bytes = (samples * 2) as u32;
+    let byte_rate = sample_rate * 2;
+
+    writer.write_all(b"RIFF")?;
+    writer.write_all(&(36u32 + data_bytes).to_le_bytes())?;
+    writer.write_all(b"WAVE")?;
+    writer.write_all(b"fmt ")?;
+    writer.write_all(&16u32.to_le_bytes())?;
+    writer.write_all(&1u16.to_le_bytes())?; // PCM
+    writer.write_all(&1u16.to_le_bytes())?; // mono
+    writer.write_all(&sample_rate.to_le_bytes())?;
+    writer.write_all(&byte_rate.to_le_bytes())?;
+    writer.write_all(&2u16.to_le_bytes())?; // block align
+    writer.write_all(&16u16.to_le_bytes())?; // bits per sample
+    writer.write_all(b"data")?;
+    writer.write_all(&data_bytes.to_le_bytes())?;
+    Ok(())
 }
 
 #[cfg(test)]
