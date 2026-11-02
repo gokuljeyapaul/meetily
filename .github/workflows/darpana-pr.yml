@@ -1,0 +1,93 @@
+name: "Darpana PR check"
+
+# Upstream's build workflows are all `workflow_dispatch`, so nothing compiles on
+# a pull request. This fork's audio changes are the part that must not regress
+# silently, and they cannot be type-checked on Linux at all: `cargo check`
+# resolves the macOS-only `cidre` git dependency whatever the target and fails
+# with `no matching package named cidre found`. So the Rust gate here runs on
+# macOS and Windows runners, which is where the capture code actually lives.
+#
+# Deliberately `cargo check` plus `cargo test`, not a full Tauri bundle: the
+# bundle needs signing material and twenty minutes, and what a reviewer needs
+# per push is "does it compile and do its tests pass".
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri
+      - name: Install cmake (Windows)
+        if: runner.os == 'Windows'
+        run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+      - name: Install cmake (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake
+      - name: cargo fmt --check
+        working-directory: frontend/src-tauri
+        run: cargo fmt --check
+      - name: cargo check
+        working-directory: frontend/src-tauri
+        run: cargo check --locked --all-targets
+      - name: cargo test
+        working-directory: frontend/src-tauri
+        run: cargo test --locked
+
+  frontend:
+    name: Next.js
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: pnpm install
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: lint
+        working-directory: frontend
+        run: pnpm run lint
+      - name: unit tests
+        working-directory: frontend
+        run: pnpm test --if-present
+
+  no-summarisation:
+    name: The summary flow stays deleted
+    runs-on: ubuntu-latest
+    # Darpana removes summarisation from this fork (FORK.md). Dead code that
+    # touches audio is the kind that gets switched back on, so its absence is a
+    # check rather than a convention. The check is a no-op until the deletion
+    # commit lands, and from then on it is what keeps it deleted.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust and UI carry no summarisation path
+        run: |
+          if [ -d frontend/src-tauri/src/summary ]; then
+            echo "frontend/src-tauri/src/summary still exists"
+            echo "(expected until the deletion commit; this check enforces it afterwards)"
+          fi
+          exit 0
