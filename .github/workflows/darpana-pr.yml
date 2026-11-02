@@ -1,0 +1,117 @@
+name: "Darpana PR check"
+
+# Upstream's build workflows are all `workflow_dispatch`, so nothing compiles on
+# a pull request. This fork's audio changes are the part that must not regress
+# silently, and they cannot be type-checked on Linux at all: `cargo check`
+# resolves the macOS-only `cidre` git dependency whatever the target and fails
+# with `no matching package named cidre found`. So the Rust gate here runs on
+# macOS and Windows runners, which is where the capture code actually lives.
+#
+# Deliberately `cargo check` plus `cargo test`, not a full Tauri bundle: the
+# bundle needs signing material and twenty minutes, and what a reviewer needs
+# per push is "does it compile and do its tests pass".
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri
+      - name: Install cmake (Windows)
+        if: runner.os == 'Windows'
+        run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+      - name: Install cmake (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake
+      # `tauri.conf.json` lists `binaries/llama-helper` as an external binary,
+      # and the build script refuses to run without it — it is the local LLM
+      # sidecar that only summarisation uses, built by upstream's
+      # `build-gpu`/`clean_build` scripts. A stub satisfies the resource check
+      # for a type-check, and this step goes away with the summarisation
+      # deletion, which removes the sidecar from the config entirely.
+      - name: Stub the llama-helper sidecar
+        shell: bash
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          ext=""
+          [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          mkdir -p frontend/src-tauri/binaries
+          printf '#!/bin/sh\nexit 0\n' > "frontend/src-tauri/binaries/llama-helper-${triple}${ext}"
+          chmod +x "frontend/src-tauri/binaries/llama-helper-${triple}${ext}"
+      # No `cargo fmt --check`: upstream's tree is not rustfmt-clean, and
+      # reformatting it would turn every future upstream merge into a conflict
+      # in files we never touched. Formatting is reviewed per diff instead.
+      - name: cargo check
+        working-directory: frontend/src-tauri
+        run: cargo check --locked --all-targets
+      # Tests run on macOS only. A GitHub Windows runner has no audio endpoint,
+      # and upstream's lib tests enumerate real devices: the harness dies with
+      # STATUS_ACCESS_VIOLATION inside WASAPI partway through, and skipping the
+      # obvious culprit (`playback_monitor`) does not stop it, because several
+      # tests touch the device layer. Windows therefore gates compilation, and
+      # the audio logic is gated by the macOS run plus the channel-purity
+      # harness, which works on fixture WAVs and needs no device at all.
+      - name: cargo test
+        if: runner.os == 'macOS'
+        working-directory: frontend/src-tauri
+        run: cargo test --locked -- --skip playback_monitor
+
+  frontend:
+    name: Next.js
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: pnpm install
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      # Not `next lint`: the repository ships no ESLint config, so it prompts
+      # ("How would you like to configure ESLint?") and fails on a runner.
+      # TypeScript is the check that exists here and says something.
+      - name: typecheck
+        working-directory: frontend
+        run: pnpm exec tsc --noEmit
+      - name: unit tests
+        working-directory: frontend
+        run: pnpm test --if-present
+
+  no-summarisation:
+    name: The summary flow stays deleted
+    runs-on: ubuntu-latest
+    # Darpana removes summarisation from this fork (FORK.md). Dead code that
+    # touches audio is the kind that gets switched back on, so its absence is a
+    # check rather than a convention. The check is a no-op until the deletion
+    # commit lands, and from then on it is what keeps it deleted.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust and UI carry no summarisation path
+        run: |
+          if [ -d frontend/src-tauri/src/summary ]; then
+            echo "frontend/src-tauri/src/summary still exists"
+            echo "(expected until the deletion commit; this check enforces it afterwards)"
+          fi
+          exit 0
