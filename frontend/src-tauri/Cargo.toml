@@ -156,6 +156,12 @@ tauri-plugin-notification = "2.3.1"
 tauri-plugin-updater = "2.3.0"
 tauri-plugin-process = "2.3.0"
 
+# Darpana: sealing captured frames under the session DEK (AES-256-GCM, the
+# same construction engine/custody/session.py uses) and digesting them.
+aes-gcm = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+
 # Desktop-only single instance guard
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "=2.3.7"
