@@ -1,3 +1,5 @@
+> **This is Darpana's capture agent, a fork of [Zackriya-Solutions/meeting-minutes](https://github.com/Zackriya-Solutions/meeting-minutes) at `a2cb62e` (v0.4.1).** Coach and coachee are recorded as separate tracks, capture is gated on consent, and summarisation is removed — see [FORK.md](FORK.md).
+
 <div align="center" style="border-bottom: none">
     <h1>
         <img src="docs/Meetily-6.png" style="border-radius: 10px;" />
