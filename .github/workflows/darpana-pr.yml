@@ -68,9 +68,12 @@ jobs:
       - name: pnpm install
         working-directory: frontend
         run: pnpm install --frozen-lockfile
-      - name: lint
+      # Not `next lint`: the repository ships no ESLint config, so it prompts
+      # ("How would you like to configure ESLint?") and fails on a runner.
+      # TypeScript is the check that exists here and says something.
+      - name: typecheck
         working-directory: frontend
-        run: pnpm run lint
+        run: pnpm exec tsc --noEmit
       - name: unit tests
         working-directory: frontend
         run: pnpm test --if-present
