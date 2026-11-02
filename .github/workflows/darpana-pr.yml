@@ -40,6 +40,21 @@ jobs:
       - name: Install cmake (macOS)
         if: runner.os == 'macOS'
         run: brew install cmake
+      # `tauri.conf.json` lists `binaries/llama-helper` as an external binary,
+      # and the build script refuses to run without it — it is the local LLM
+      # sidecar that only summarisation uses, built by upstream's
+      # `build-gpu`/`clean_build` scripts. A stub satisfies the resource check
+      # for a type-check, and this step goes away with the summarisation
+      # deletion, which removes the sidecar from the config entirely.
+      - name: Stub the llama-helper sidecar
+        shell: bash
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          ext=""
+          [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          mkdir -p frontend/src-tauri/binaries
+          printf '#!/bin/sh\nexit 0\n' > "frontend/src-tauri/binaries/llama-helper-${triple}${ext}"
+          chmod +x "frontend/src-tauri/binaries/llama-helper-${triple}${ext}"
       # No `cargo fmt --check`: upstream's tree is not rustfmt-clean, and
       # reformatting it would turn every future upstream merge into a conflict
       # in files we never touched. Formatting is reviewed per diff instead.
