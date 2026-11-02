@@ -61,9 +61,14 @@ jobs:
       - name: cargo check
         working-directory: frontend/src-tauri
         run: cargo check --locked --all-targets
+      # `playback_monitor` queries the default output device. A GitHub Windows
+      # runner has no audio endpoint, so that test fails and then takes the
+      # whole harness down with STATUS_ACCESS_VIOLATION inside WASAPI. It is a
+      # device test, not logic, and it is excluded rather than silenced: the
+      # channel-purity work this CI exists for runs on fixture WAVs.
       - name: cargo test
         working-directory: frontend/src-tauri
-        run: cargo test --locked
+        run: cargo test --locked -- --skip playback_monitor
 
   frontend:
     name: Next.js
