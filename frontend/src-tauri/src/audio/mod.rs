@@ -23,6 +23,10 @@ pub mod recording_manager;
 pub mod recording_commands;
 pub mod recording_preferences;
 pub mod recording_saver;
+pub mod two_track;  // Darpana: coach and coachee tracks written unmixed
+pub mod echo_gate;
+pub mod echo_probe_device;  // Darpana: the gate's probe on real devices  // Darpana: refuse to record when the speakers reach the mic
+pub mod refusals;  // Darpana: the engine's refusal wording, vendored
 pub mod incremental_saver;  // NEW: Incremental audio saving with checkpoints
 pub mod level_monitor;
 pub mod simple_level_monitor;

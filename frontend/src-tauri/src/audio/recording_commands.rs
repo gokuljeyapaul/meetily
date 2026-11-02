@@ -146,6 +146,22 @@ fn map_recording_start_error<R: Runtime>(
             }
             TRANSCRIPTION_RUNTIME_START_ERROR_CODE.to_string()
         }
+        RecordingStartError::EchoGate(sentence) => {
+            // The engine's wording reaches the coach unchanged: it already
+            // says what happened, why it matters and what to do about it, and
+            // paraphrasing it here would let the desktop agent and the
+            // engine disagree about the same refusal.
+            error!("Echo gate refused the recording: {sentence}");
+            if let Err(emit_error) = app.emit("capture-refused", serde_json::json!({
+                "reason": "echo_gate",
+                "userMessage": sentence,
+                "actionable": true,
+                "phase": "startup"
+            })) {
+                error!("Failed to emit echo gate refusal: {emit_error}");
+            }
+            sentence
+        }
         RecordingStartError::Other(error) => format!("Failed to start recording: {error}"),
     }
 }
@@ -1458,6 +1474,13 @@ fn spawn_device_event_processor<R: Runtime>(
                     // This is intentional — just log and do nothing.
                     info!("[DEVICE_EVENTS] Device reconnected: '{}' ({:?}) — staying on current mic (fallback is sticky)", device_name, device_type);
                 }
+                DeviceEvent::OutputDeviceChanged { ref device_name } => {
+                    info!("[DEVICE_EVENTS] Output device changed to '{}' — re-running the echo gate", device_name);
+                    let app_clone = app.clone();
+                    tokio::spawn(async move {
+                        pause_if_the_new_output_echoes(app_clone).await;
+                    });
+                }
                 DeviceEvent::DeviceListChanged => {
                     debug!("[DEVICE_EVENTS] Device list changed");
                 }
@@ -1465,6 +1488,54 @@ fn spawn_device_event_processor<R: Runtime>(
         }
         info!("[DEVICE_EVENTS] Background event processor stopped (channel closed)");
     });
+}
+
+/// Re-runs the echo gate after the output device changed, and pauses the
+/// recording if the new device echoes or cannot be tested.
+///
+/// Pausing rather than stopping: the coach may well put the headphones back
+/// on, and the audio recorded so far is still clean — what must not happen is
+/// another second of the coachee's voice arriving on the coach's track.
+async fn pause_if_the_new_output_echoes<R: Runtime>(app: AppHandle<R>) {
+    let verdict = tokio::task::spawn_blocking(|| {
+        let mut player = match super::echo_probe_device::DeviceProbePlayer::for_default_output() {
+            Ok(player) => player,
+            Err(e) => {
+                warn!("Echo gate could not reach the new output device: {e}");
+                return Some(super::refusals::ECHO_TEST_COULD_NOT_RUN.to_string());
+            }
+        };
+        match super::echo_gate::run_echo_test(&mut player, 48_000) {
+            Ok(super::echo_gate::EchoVerdict::Clear { .. }) => None,
+            Ok(verdict) => Some(verdict.refusal_sentence().unwrap_or_else(|| {
+                super::refusals::ECHO_HEARD_IN_MICROPHONE.to_string()
+            })),
+            Err(e) => {
+                warn!("Echo gate could not measure the new output device: {e}");
+                Some(super::refusals::ECHO_TEST_COULD_NOT_RUN.to_string())
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Some(super::refusals::ECHO_TEST_COULD_NOT_RUN.to_string()));
+
+    let Some(sentence) = verdict else {
+        info!("[ECHO_GATE] The new output device is clear — recording continues");
+        return;
+    };
+
+    error!("[ECHO_GATE] Pausing the recording: {sentence}");
+    if let Err(e) = pause_recording(app.clone()).await {
+        error!("[ECHO_GATE] Failed to pause after a refused output device: {e}");
+    }
+    if let Err(e) = app.emit("capture-paused", serde_json::json!({
+        "reason": "echo_gate",
+        "userMessage": sentence,
+        "actionable": true,
+        "phase": "recording"
+    })) {
+        error!("[ECHO_GATE] Failed to emit the pause: {e}");
+    }
 }
 
 /// Disconnect fallback: swap the active mic to the system default input

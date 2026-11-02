@@ -14,6 +14,9 @@ use super::pipeline::AudioPipelineManager;
 use super::stream::AudioStreamManager;
 use super::recording_saver::RecordingSaver;
 use super::device_monitor::{AudioDeviceMonitor, DeviceEvent};
+use super::echo_gate::{EchoGate, GateAction};
+use super::echo_probe_device::DeviceProbePlayer;
+use super::refusals;
 
 /// Stream manager type enumeration
 pub enum StreamManagerType {
@@ -26,6 +29,9 @@ pub(crate) enum RecordingStartError {
     TranscriptionRuntime(#[source] anyhow::Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+    /// The echo gate refused: the sentence is the engine's, shown as it is.
+    #[error("{0}")]
+    EchoGate(String),
 }
 
 // ============================================================================
@@ -191,6 +197,9 @@ pub struct RecordingManager {
     recording_saver: RecordingSaver,
     device_monitor: Option<AudioDeviceMonitor>,
     device_event_receiver: Option<mpsc::UnboundedReceiver<DeviceEvent>>,
+    /// Held for the length of the recording so a change of output device can
+    /// be re-tested against the device the gate originally passed.
+    echo_gate: Option<EchoGate>,
 }
 
 // SAFETY: RecordingManager contains types that we've marked as Send
@@ -211,6 +220,7 @@ impl RecordingManager {
             recording_saver: RecordingSaver::new(),
             device_monitor: Some(device_monitor),
             device_event_receiver: Some(device_event_receiver),
+            echo_gate: None,
         }
     }
 
@@ -232,6 +242,19 @@ impl RecordingManager {
         auto_save: bool,
     ) -> std::result::Result<mpsc::UnboundedReceiver<AudioChunk>, RecordingStartError> {
         info!("Starting recording manager (auto_save: {})", auto_save);
+
+        // The echo gate runs before any state changes or files open: if the
+        // speakers reach the microphone, the coachee's voice lands on the
+        // coach track and no later step can separate or delete it. A gate that
+        // cannot measure refuses as well — there is no "probably fine" here.
+        match self.open_echo_gate() {
+            Ok(gate) => {
+                self.echo_gate = Some(gate);
+            }
+            Err(sentence) => {
+                return Err(RecordingStartError::EchoGate(sentence));
+            }
+        }
 
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
@@ -276,11 +299,16 @@ impl RecordingManager {
             return Err(RecordingStartError::TranscriptionRuntime(error));
         }
 
-        self.recording_saver.start_accumulation(auto_save, recording_receiver);
+        // Device names first: each track records the device that wrote it, and
+        // a pre-mixed device has to be refused before any file is opened.
         self.recording_saver.set_device_info(
             microphone_device.as_ref().map(|d| d.name.clone()),
             system_device.as_ref().map(|d| d.name.clone())
         );
+        if let Err(error) = self.recording_saver.start_accumulation(auto_save, recording_receiver) {
+            self.state.stop_recording();
+            return Err(RecordingStartError::Other(error));
+        }
 
         // Give the pipeline a moment to fully initialize before starting streams
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -596,6 +624,52 @@ impl RecordingManager {
             monitor.notify_mic_swapped(device.name.clone(), system_name);
         }
         self.state.set_microphone_device(device);
+    }
+
+    /// Runs the echo gate on the current output device.
+    ///
+    /// `Err` carries the engine's refusal sentence, already written for the
+    /// coach. Every failure path — no output device, a stream that will not
+    /// open, a microphone that returns nothing — refuses, because a gate that
+    /// passes when it cannot measure is not a gate.
+    fn open_echo_gate(&self) -> std::result::Result<EchoGate, String> {
+        let mut player = DeviceProbePlayer::for_default_output().map_err(|e| {
+            warn!("Echo gate could not reach an output device: {}", e);
+            refusals::ECHO_TEST_COULD_NOT_RUN.to_string()
+        })?;
+        match EchoGate::open(&mut player, 48_000) {
+            Ok(gate) => Ok(gate),
+            Err(e) => {
+                warn!("Echo gate refused: {}", e);
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// Re-runs the gate after the output device changed, and reports whether
+    /// the recording may continue. A device that now echoes, or that cannot be
+    /// tested, pauses the recording rather than recording onto a track that
+    /// could never be severed.
+    pub(crate) fn recheck_echo_gate_after_output_change(&mut self) -> GateAction {
+        let mut player = match DeviceProbePlayer::for_default_output() {
+            Ok(player) => player,
+            Err(e) => {
+                warn!("Echo gate could not reach the new output device: {}", e);
+                return GateAction::Pause(refusals::ECHO_TEST_COULD_NOT_RUN.to_string());
+            }
+        };
+        let Some(gate) = self.echo_gate.as_mut() else {
+            // No gate was opened, so there is nothing that was ever passed:
+            // treat it the same as a failed test.
+            return GateAction::Pause(refusals::ECHO_TEST_COULD_NOT_RUN.to_string());
+        };
+        match gate.output_device_changed(&mut player) {
+            Ok(action) => action,
+            Err(e) => {
+                warn!("Echo gate refused the new output device: {}", e);
+                GateAction::Pause(e.to_string())
+            }
+        }
     }
 
     /// Get reference to recording state for external access

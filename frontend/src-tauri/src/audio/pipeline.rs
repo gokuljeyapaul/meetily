@@ -705,8 +705,8 @@ pub struct AudioPipeline {
     // PROFESSIONAL AUDIO MIXING: Ring buffer + RMS-based mixer
     ring_buffer: AudioMixerRingBuffer,
     mixer: ProfessionalAudioMixer,
-    // Recording sender for pre-mixed audio
-    recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    // Recording sender for raw, per-device audio (never the mix)
+    recording_sender_raw: Option<mpsc::UnboundedSender<AudioChunk>>,
 }
 
 impl AudioPipeline {
@@ -784,7 +784,7 @@ impl AudioPipeline {
             // Initialize professional audio mixing
             ring_buffer,
             mixer,
-            recording_sender_for_mixed: None,  // Will be set by manager
+            recording_sender_raw: None,  // Will be set by manager
         })
     }
 
@@ -839,7 +839,21 @@ impl AudioPipeline {
                         self.last_summary_time = std::time::Instant::now();
                     }
 
-                    // STEP 1: Add raw audio to ring buffer for mixing
+                    // STEP 1: Send the raw chunk to the recording path, still
+                    // tagged with the device that produced it. This happens
+                    // before mixing, and it is the only audio that reaches
+                    // disk: the mix below exists for the live transcript only.
+                    if let Some(ref sender) = self.recording_sender_raw {
+                        let _ = sender.send(AudioChunk {
+                            data: chunk.data.clone(),
+                            sample_rate: chunk.sample_rate,
+                            timestamp: chunk.timestamp,
+                            chunk_id: chunk.chunk_id,
+                            device_type: chunk.device_type.clone(),
+                        });
+                    }
+
+                    // STEP 2: Add raw audio to ring buffer for mixing
                     // Microphone audio is already normalized at capture level (AudioCapture)
                     // System audio remains raw
                     self.ring_buffer.add_samples(chunk.device_type.clone(), chunk.data);
@@ -890,17 +904,11 @@ impl AudioPipeline {
                                 }
                             }
 
-                            // STEP 4: Send mixed audio for recording (WAV file)
-                            if let Some(ref sender) = self.recording_sender_for_mixed {
-                                let recording_chunk = AudioChunk {
-                                    data: mixed_with_gain.clone(),
-                                    sample_rate: self.sample_rate,
-                                    timestamp: chunk.timestamp,
-                                    chunk_id: self.chunk_id_counter,
-                                    device_type: DeviceType::Microphone,  // Mixed audio
-                                };
-                                let _ = sender.send(recording_chunk);
-                            }
+                            // The mixed window deliberately stops here. Writing
+                            // it would put coachee speech on the coach's track
+                            // and make severance impossible; the two unmixed
+                            // tracks were already sent in STEP 1.
+
                         }
                     }
                 }
@@ -1017,7 +1025,7 @@ impl AudioPipelineManager {
 
         // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
         // This ensures both mic AND system audio are captured in recordings
-        pipeline.recording_sender_for_mixed = recording_sender;
+        pipeline.recording_sender_raw = recording_sender;
 
         let handle = tokio::spawn(async move {
             pipeline.run().await

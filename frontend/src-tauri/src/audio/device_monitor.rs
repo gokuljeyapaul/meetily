@@ -19,6 +19,12 @@ pub enum DeviceEvent {
         device_name: String,
         device_type: DeviceMonitorType,
     },
+    /// The default output device changed mid-recording. The echo gate has to
+    /// run again: headphones passed, but the laptop speakers the call just
+    /// moved to would put the coachee's voice on the coach's track.
+    OutputDeviceChanged {
+        device_name: String,
+    },
     /// A previously disconnected device has reconnected
     DeviceReconnected {
         device_name: String,
@@ -277,6 +283,9 @@ impl AudioDeviceMonitor {
         device_update_mailbox: Arc<std::sync::Mutex<Option<(String, Option<String>)>>>,
     ) {
         let mut last_device_list = Vec::new();
+        let mut last_output_device: Option<String> = super::devices::default_output_device()
+            .ok()
+            .map(|d| d.name.clone());
         let check_interval = Duration::from_secs(2); // Poll every 2 seconds
 
         #[cfg(target_os = "macos")]
@@ -330,6 +339,22 @@ impl AudioDeviceMonitor {
                         }
                     }
                 }
+            }
+
+            // The output device is watched by name rather than by event:
+            // the same 2 s poll already runs here, and a name change is what
+            // the echo gate needs to know about.
+            let current_output = super::devices::default_output_device()
+                .ok()
+                .map(|d| d.name.clone());
+            if current_output != last_output_device {
+                if let Some(ref name) = current_output {
+                    info!("[DEVICE_MONITOR] Default output device changed to '{}'", name);
+                    let _ = event_sender.send(DeviceEvent::OutputDeviceChanged {
+                        device_name: name.clone(),
+                    });
+                }
+                last_output_device = current_output;
             }
 
             // Check if device list changed

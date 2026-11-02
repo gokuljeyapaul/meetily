@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use super::recording_state::AudioChunk;
 use super::audio_processing::create_meeting_folder;
-use super::incremental_saver::IncrementalAudioSaver;
+use super::two_track::{TwoTrackRecorder, TwoTrackResult};
 
 /// Structured transcript segment for JSON export
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,7 +34,11 @@ pub struct MeetingMetadata {
     pub completed_at: Option<String>,
     pub duration_seconds: Option<f64>,
     pub devices: DeviceInfo,
+    /// The coach's track: the microphone device, nothing else on it.
     pub audio_file: String,
+    /// The coachee's track: the system-audio capture, written separately so
+    /// coachee audio can be deleted without touching the coach's.
+    pub coachee_audio_file: String,
     pub transcript_file: String,
     pub sample_rate: u32,
     pub status: String,  // "recording", "completed", "error"
@@ -46,9 +50,11 @@ pub struct DeviceInfo {
     pub system_audio: Option<String>,
 }
 
-/// New recording saver using incremental saving strategy
+/// Writes a recording as two unmixed tracks, one per device.
 pub struct RecordingSaver {
-    incremental_saver: Option<Arc<AsyncMutex<IncrementalAudioSaver>>>,
+    two_track: Option<Arc<AsyncMutex<Option<TwoTrackRecorder>>>>,
+    mic_device_name: Option<String>,
+    system_device_name: Option<String>,
     meeting_folder: Option<PathBuf>,
     meeting_name: Option<String>,
     metadata: Option<MeetingMetadata>,
@@ -59,7 +65,9 @@ pub struct RecordingSaver {
 impl RecordingSaver {
     pub fn new() -> Self {
         Self {
-            incremental_saver: None,
+            two_track: None,
+            mic_device_name: None,
+            system_device_name: None,
             meeting_folder: None,
             meeting_name: None,
             metadata: None,
@@ -75,6 +83,10 @@ impl RecordingSaver {
 
     /// Set device information in metadata
     pub fn set_device_info(&mut self, mic_name: Option<String>, sys_name: Option<String>) {
+        // Kept as fields too: the two-track recorder needs them before the
+        // meeting folder exists, and each track records the device that wrote it.
+        self.mic_device_name = mic_name.clone();
+        self.system_device_name = sys_name.clone();
         if let Some(ref mut metadata) = self.metadata {
             metadata.devices.microphone = mic_name;
             metadata.devices.system_audio = sys_name;
@@ -135,11 +147,14 @@ impl RecordingSaver {
     ///
     /// # Arguments
     /// * `auto_save` - If true, creates checkpoints and enables saving. If false, audio chunks are discarded.
+    ///
+    /// Fails, rather than recording a mixed track, when a device turns out to
+    /// be a pre-mixed endpoint.
     pub fn start_accumulation(
         &mut self,
         auto_save: bool,
         mut receiver: mpsc::UnboundedReceiver<AudioChunk>,
-    ) {
+    ) -> Result<()> {
         if auto_save {
             info!("Initializing incremental audio saver for recording (auto-save ENABLED)");
         } else {
@@ -149,13 +164,10 @@ impl RecordingSaver {
         // Initialize meeting folder and incremental saver ONLY if auto_save is enabled
         if auto_save {
             if let Some(name) = self.meeting_name.clone() {
-                match self.initialize_meeting_folder(&name, true) {
-                    Ok(()) => info!("Successfully initialized meeting folder with checkpoints"),
-                    Err(e) => {
-                        error!("Failed to initialize meeting folder: {}", e);
-                        // Continue anyway - will use fallback flat structure
-                    }
-                }
+                // A failure here is fatal on purpose: the alternative is a
+                // recording whose tracks are not separated.
+                self.initialize_meeting_folder(&name, true)?;
+                info!("Successfully initialized meeting folder with two unmixed tracks");
             }
         } else {
             // When auto_save is false, still create meeting folder for transcripts/metadata
@@ -172,7 +184,7 @@ impl RecordingSaver {
 
         // Start accumulation task
         let is_saving_clone = self.is_saving.clone();
-        let incremental_saver_arc = self.incremental_saver.clone();
+        let two_track_arc = self.two_track.clone();
         let save_audio = auto_save;
 
         tokio::spawn(async move {
@@ -192,14 +204,17 @@ impl RecordingSaver {
 
                 // Only process audio chunks if auto_save is enabled
                 if save_audio {
-                    // Add chunk to incremental saver
-                    if let Some(saver_arc) = &incremental_saver_arc {
-                        let mut saver_guard = saver_arc.lock().await;
-                        if let Err(e) = saver_guard.add_chunk(chunk) {
-                            error!("Failed to add chunk to incremental saver: {}", e);
+                    // The chunk's device type decides its track; nothing here
+                    // combines the two.
+                    if let Some(recorder_arc) = &two_track_arc {
+                        let mut guard = recorder_arc.lock().await;
+                        if let Some(recorder) = guard.as_mut() {
+                            if let Err(e) = recorder.write_chunk(&chunk) {
+                                error!("Failed to write chunk to its track: {}", e);
+                            }
                         }
                     } else {
-                        error!("Incremental saver not available while accumulating");
+                        error!("Two-track recorder not available while accumulating");
                     }
                 } else {
                     // auto_save is false: discard audio chunk (no-op)
@@ -214,6 +229,8 @@ impl RecordingSaver {
         if let Ok(mut is_saving) = self.is_saving.lock() {
             *is_saving = true;
         }
+
+        Ok(())
     }
 
     /// Initialize meeting folder structure and metadata
@@ -228,13 +245,16 @@ impl RecordingSaver {
         // Create meeting folder structure (with or without .checkpoints/ subdirectory)
         let meeting_folder = create_meeting_folder(&base_folder, meeting_name, create_checkpoints)?;
 
-        // Only initialize incremental saver if checkpoints are needed (auto_save is true)
+        // Only open the track files when audio is being kept at all
         if create_checkpoints {
-            let incremental_saver = IncrementalAudioSaver::new(meeting_folder.clone(), 48000)?;
-            self.incremental_saver = Some(Arc::new(AsyncMutex::new(incremental_saver)));
-            info!("✅ Incremental audio saver initialized for meeting: {}", meeting_name);
+            let mic_device = self.mic_device_name.clone().unwrap_or_default();
+            let system_device = self.system_device_name.clone().unwrap_or_default();
+            let recorder =
+                TwoTrackRecorder::new(&meeting_folder, 48000, &mic_device, &system_device)?;
+            self.two_track = Some(Arc::new(AsyncMutex::new(Some(recorder))));
+            info!("✅ Two unmixed tracks opened for meeting: {}", meeting_name);
         } else {
-            info!("⚠️  Skipped incremental audio saver (auto-save disabled)");
+            info!("⚠️  No audio tracks opened (auto-save disabled)");
         }
 
         // Create initial metadata
@@ -249,7 +269,8 @@ impl RecordingSaver {
                 microphone: None,  // Could be enhanced to store actual device names
                 system_audio: None,
             },
-            audio_file: if create_checkpoints { "audio.mp4".to_string() } else { "".to_string() },
+            audio_file: if create_checkpoints { "coach.wav".to_string() } else { String::new() },
+            coachee_audio_file: if create_checkpoints { "coachee.wav".to_string() } else { String::new() },
             transcript_file: "transcripts.json".to_string(),
             sample_rate: 48000,
             status: "recording".to_string(),
@@ -333,9 +354,13 @@ impl RecordingSaver {
 
     // in frontend/src-tauri/src/audio/recording_saver.rs
     pub fn get_stats(&self) -> (usize, u32) {
-        if let Some(ref saver) = self.incremental_saver {
-            if let Ok(guard) = saver.try_lock() {
-                (guard.get_checkpoint_count() as usize, 48000)
+        if let Some(ref recorder) = self.two_track {
+            if let Ok(guard) = recorder.try_lock() {
+                let samples = guard
+                    .as_ref()
+                    .map(|r| r.coach_samples().max(r.coachee_samples()) as usize)
+                    .unwrap_or(0);
+                (samples, 48000)
             } else {
                 (0, 48000)
             }
@@ -364,8 +389,8 @@ impl RecordingSaver {
         // Give time for final chunks
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-        // Check if incremental saver exists (indicates auto_save was enabled)
-        let should_save_audio = self.incremental_saver.is_some();
+        // The track recorder exists only when auto_save was enabled
+        let should_save_audio = self.two_track.is_some();
 
         if !should_save_audio {
             info!("⚠️  No audio saver initialized (auto-save was disabled) - skipping audio finalization");
@@ -373,23 +398,32 @@ impl RecordingSaver {
             return Ok(None);
         }
 
-        // Finalize incremental saver (merge checkpoints into final audio.mp4)
-        let final_audio_path = if let Some(saver_arc) = &self.incremental_saver {
-            let mut saver = saver_arc.lock().await;
-            match saver.finalize().await {
-                Ok(path) => {
-                    info!("✅ Successfully finalized audio: {}", path.display());
-                    path
-                }
-                Err(e) => {
-                    error!("❌ Failed to finalize incremental saver: {}", e);
-                    return Err(format!("Failed to finalize audio: {}", e));
-                }
+        // Close both tracks. They are never merged: the engine reads them as
+        // the coach channel and the coachee channel.
+        let tracks: TwoTrackResult = if let Some(recorder_arc) = &self.two_track {
+            let recorder = recorder_arc.lock().await.take();
+            match recorder {
+                Some(recorder) => match recorder.finish() {
+                    Ok(tracks) => {
+                        info!(
+                            "✅ Wrote {} and {}",
+                            tracks.coach.path.display(),
+                            tracks.coachee.path.display()
+                        );
+                        tracks
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to finalize the tracks: {}", e);
+                        return Err(format!("Failed to finalize audio: {}", e));
+                    }
+                },
+                None => return Err("The tracks were already finalized".to_string()),
             }
         } else {
-            error!("No incremental saver initialized - cannot save recording");
-            return Err("No incremental saver initialized".to_string());
+            error!("No track recorder initialized - cannot save recording");
+            return Err("No track recorder initialized".to_string());
         };
+        let final_audio_path = tracks.coach.path.clone();
 
         // Save final transcripts.json with validation
         if let Some(folder) = &self.meeting_folder {
@@ -433,6 +467,10 @@ impl RecordingSaver {
         // Emit save event with audio and transcript paths
         let save_event = serde_json::json!({
             "audio_file": final_audio_path.to_string_lossy(),
+            "coach_audio_file": tracks.coach.path.to_string_lossy(),
+            "coach_device": tracks.coach.device_name,
+            "coachee_audio_file": tracks.coachee.path.to_string_lossy(),
+            "coachee_device": tracks.coachee.device_name,
             "transcript_file": self.meeting_folder.as_ref()
                 .map(|f| f.join("transcripts.json").to_string_lossy().to_string()),
             "meeting_name": self.meeting_name,
