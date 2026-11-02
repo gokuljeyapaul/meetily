@@ -276,11 +276,16 @@ impl RecordingManager {
             return Err(RecordingStartError::TranscriptionRuntime(error));
         }
 
-        self.recording_saver.start_accumulation(auto_save, recording_receiver);
+        // Device names first: each track records the device that wrote it, and
+        // a pre-mixed device has to be refused before any file is opened.
         self.recording_saver.set_device_info(
             microphone_device.as_ref().map(|d| d.name.clone()),
             system_device.as_ref().map(|d| d.name.clone())
         );
+        if let Err(error) = self.recording_saver.start_accumulation(auto_save, recording_receiver) {
+            self.state.stop_recording();
+            return Err(RecordingStartError::Other(error));
+        }
 
         // Give the pipeline a moment to fully initialize before starting streams
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
