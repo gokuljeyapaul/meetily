@@ -23,6 +23,7 @@ pub mod recording_manager;
 pub mod recording_commands;
 pub mod recording_preferences;
 pub mod recording_saver;
+pub mod two_track;  // Darpana: coach and coachee tracks written unmixed
 pub mod incremental_saver;  // NEW: Incremental audio saving with checkpoints
 pub mod level_monitor;
 pub mod simple_level_monitor;
