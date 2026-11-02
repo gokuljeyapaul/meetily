@@ -61,12 +61,15 @@ jobs:
       - name: cargo check
         working-directory: frontend/src-tauri
         run: cargo check --locked --all-targets
-      # `playback_monitor` queries the default output device. A GitHub Windows
-      # runner has no audio endpoint, so that test fails and then takes the
-      # whole harness down with STATUS_ACCESS_VIOLATION inside WASAPI. It is a
-      # device test, not logic, and it is excluded rather than silenced: the
-      # channel-purity work this CI exists for runs on fixture WAVs.
+      # Tests run on macOS only. A GitHub Windows runner has no audio endpoint,
+      # and upstream's lib tests enumerate real devices: the harness dies with
+      # STATUS_ACCESS_VIOLATION inside WASAPI partway through, and skipping the
+      # obvious culprit (`playback_monitor`) does not stop it, because several
+      # tests touch the device layer. Windows therefore gates compilation, and
+      # the audio logic is gated by the macOS run plus the channel-purity
+      # harness, which works on fixture WAVs and needs no device at all.
       - name: cargo test
+        if: runner.os == 'macOS'
         working-directory: frontend/src-tauri
         run: cargo test --locked -- --skip playback_monitor
 
