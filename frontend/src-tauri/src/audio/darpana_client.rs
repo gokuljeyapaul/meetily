@@ -65,8 +65,7 @@ pub struct ConsentAnswer {
 impl ConsentAnswer {
     /// Whether capture may start, decided by the vendored table and not here.
     pub fn may_start(&self) -> Result<(), Refusal> {
-        let _ = Lifecycle::vendored();
-        Ok(())
+        Lifecycle::vendored().may_start_recording(&self.reason)
     }
 }
 
@@ -92,6 +91,19 @@ impl DarpanaClient {
     /// The key and the DEK both travel here, so `http://` is accepted only for
     /// a loopback address, which is where the test service runs.
     pub fn new(base_url: String, agent_key: String) -> Result<Self, AskRefused> {
+        if base_url.is_empty() {
+            return Err(AskRefused::NotConfigured("service address"));
+        }
+        if agent_key.is_empty() {
+            return Err(AskRefused::NotConfigured("agent key"));
+        }
+        let loopback = base_url.starts_with("http://127.0.0.1")
+            || base_url.starts_with("http://localhost");
+        if !base_url.starts_with("https://") && !loopback {
+            return Err(AskRefused::Unanswered(
+                "the agent will not send its key over a plaintext connection".to_string(),
+            ));
+        }
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             agent_key,
@@ -139,6 +151,35 @@ impl DarpanaClient {
     }
 }
 
+/// The Darpana session this recording belongs to, set by the coach's app
+/// before it asks to record. Unset means the agent has no session to ask
+/// about, which is a refusal and not a default.
+static SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Name the session this recording belongs to.
+pub fn set_session_id(session_id: Option<String>) {
+    *SESSION_ID.lock().expect("the session cell is not poisoned") = session_id;
+}
+
+/// The session the agent would ask about, if any.
+pub fn session_id() -> Option<String> {
+    SESSION_ID
+        .lock()
+        .expect("the session cell is not poisoned")
+        .clone()
+}
+
+/// The gate `start_recording` calls: the wrapped DEK for the session named by
+/// the coach's app, or the reason this machine will not record.
+pub fn may_record_this_session() -> Result<String, String> {
+    match session_id() {
+        Some(session) => may_record(&session),
+        None => Err("no Darpana session has been named for this recording, so the agent cannot \
+                     ask whether it may record and will not record"
+            .to_string()),
+    }
+}
+
 /// The one gate `start_recording` calls: may this session be recorded, and
 /// with which key. Every failure path refuses.
 pub fn may_record(session_id: &str) -> Result<String, String> {
@@ -155,6 +196,15 @@ pub fn may_record(session_id: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_no_session_named_the_agent_refuses_to_record() {
+        set_session_id(None);
+
+        let refused = may_record_this_session().expect_err("an unnamed session refuses");
+
+        assert!(refused.contains("will not record"));
+    }
 
     #[test]
     fn an_agent_with_no_key_refuses_rather_than_records() {

@@ -131,6 +131,16 @@ struct TranscriptionStatus {
     last_activity_ms: u64,
 }
 
+/// Name the Darpana session this recording belongs to (card I2-E1-S3-T2).
+///
+/// The agent asks the engine about this session before any device opens; with
+/// no session named, it refuses rather than recording an unconsented one.
+#[tauri::command]
+async fn set_darpana_session(session_id: Option<String>) -> Result<(), String> {
+    audio::darpana_client::set_session_id(session_id);
+    Ok(())
+}
+
 #[tauri::command]
 async fn start_recording<R: Runtime>(
     app: AppHandle<R>,
@@ -582,6 +592,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             start_recording,
+            set_darpana_session,
             stop_recording,
             is_recording,
             get_transcription_status,
