@@ -707,7 +707,54 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     info!("✅ Recording started with custom devices using async-first approach");
 
+    spawn_darpana_consent_watch(app.clone());
+
     Ok(())
+}
+
+/// Keep asking Darpana whether this session may still be recorded — card
+/// I2-E1-S3-T3.
+///
+/// Consent is not a question answered once at the start: a coachee may
+/// withdraw mid-session, and the recording must stop without waiting for
+/// anyone to press a button. The poller owns no judgement — `roster_watch`
+/// turns each answer into an action using the engine's own wording — and an
+/// unanswered question pauses, because it is not a yes.
+///
+/// Roster-only pauses (a third party joining) are not wired: this app has no
+/// meeting-platform participant list, so there is nothing to read. That is
+/// `Watch::observe`, which is tested and waits on a roster source.
+fn spawn_darpana_consent_watch<R: Runtime>(app: AppHandle<R>) {
+    use super::roster_watch::{Action, Watch};
+
+    tauri::async_runtime::spawn(async move {
+        let mut watch = Watch::new();
+        while IS_RECORDING.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            if !IS_RECORDING.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let answer = match super::darpana_client::session_id() {
+                Some(session) => super::darpana_client::DarpanaClient::from_env()
+                    .map_err(|refused| refused.to_string())
+                    .and_then(|client| {
+                        client
+                            .consent(&session)
+                            .map_err(|refused| refused.to_string())
+                    }),
+                None => Err("no Darpana session is named for this recording".to_string()),
+            };
+
+            if let Action::Pause(sentence) = watch.observe_consent(answer) {
+                info!("Darpana withdrew this recording; pausing");
+                let _ = app.emit("darpana-recording-paused", sentence);
+                if let Err(error) = pause_recording(app.clone()).await {
+                    error!("could not pause after Darpana withdrew consent: {}", error);
+                }
+            }
+        }
+    });
 }
 
 /// Stop recording with optimized graceful shutdown ensuring NO transcript chunks are lost
