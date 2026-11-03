@@ -31,6 +31,7 @@ pub mod sealed_upload;  // Darpana: resumable upload and crash recovery
 pub mod session_lifecycle;  // Darpana: the engine's state table, vendored
 pub mod darpana_client;  // Darpana: what the agent asks before it records
 pub mod roster;  // Darpana: the fail-closed roster policy, vendored
+pub mod roster_watch;  // Darpana: what the poller does while recording
 pub mod refusals;  // Darpana: the engine's refusal wording, vendored
 pub mod incremental_saver;  // NEW: Incremental audio saving with checkpoints
 pub mod level_monitor;
