@@ -338,6 +338,17 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
+    // Darpana (card I2-E1-S3-T2): ask the engine before any device opens. The
+    // answer is the engine's, the refusal is in its words, and the key this
+    // returns is what the sealed writer seals with. Every failure path refuses.
+    let _wrapped_dek = match super::darpana_client::may_record_this_session() {
+        Ok(wrapped_dek) => wrapped_dek,
+        Err(refusal) => {
+            info!("Darpana refused this recording");
+            return Err(refusal);
+        }
+    };
+
     if let Err(error) = crate::ensure_onnx_runtime_available() {
         return Err(map_recording_start_error(
             &app,
@@ -527,6 +538,17 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     if current_recording_state {
         return Err("Recording already in progress".to_string());
     }
+
+    // Darpana (card I2-E1-S3-T2): ask the engine before any device opens. The
+    // answer is the engine's, the refusal is in its words, and the key this
+    // returns is what the sealed writer seals with. Every failure path refuses.
+    let _wrapped_dek = match super::darpana_client::may_record_this_session() {
+        Ok(wrapped_dek) => wrapped_dek,
+        Err(refusal) => {
+            info!("Darpana refused this recording");
+            return Err(refusal);
+        }
+    };
 
     if let Err(error) = crate::ensure_onnx_runtime_available() {
         return Err(map_recording_start_error(
