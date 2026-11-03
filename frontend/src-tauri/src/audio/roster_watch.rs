@@ -99,8 +99,13 @@ impl Watch {
     /// meeting-platform integration yet: consent only. A refusal or an
     /// unanswered question pauses; nothing here judges who is in the room.
     pub fn observe_consent(&mut self, consent: Result<ConsentAnswer, String>) -> Action {
-        let _ = consent;
-        Action::Continue
+        match consent {
+            Err(unanswered) => self.pause_with(unanswered),
+            Ok(answer) => match answer.may_start() {
+                Err(refusal) => self.pause_with(refusal.to_string()),
+                Ok(()) => Action::Continue,
+            },
+        }
     }
 
     fn pause_with(&mut self, sentence: String) -> Action {
