@@ -53,9 +53,8 @@ impl Watch {
         reading: Option<RosterReading>,
         consent: Result<ConsentAnswer, String>,
     ) -> Action {
-        let _ = (reading, consent);
-        return Action::Continue;
-        #[allow(unreachable_code)]
+        // Consent first: a withdrawal outranks a clean roster, and an
+        // unanswered question is not a yes.
         match consent {
             Err(unanswered) => return self.pause_with(unanswered),
             Ok(answer) => {
@@ -94,6 +93,14 @@ impl Watch {
                 }
             }
         }
+    }
+
+    /// One poll where no roster is available at all, because this app has no
+    /// meeting-platform integration yet: consent only. A refusal or an
+    /// unanswered question pauses; nothing here judges who is in the room.
+    pub fn observe_consent(&mut self, consent: Result<ConsentAnswer, String>) -> Action {
+        let _ = consent;
+        Action::Continue
     }
 
     fn pause_with(&mut self, sentence: String) -> Action {
@@ -223,6 +230,20 @@ mod tests {
             watch.observe(Some(RosterReading::default()), live()),
             Action::Continue
         );
+    }
+
+    #[test]
+    fn with_no_roster_source_consent_alone_still_pauses_a_withdrawal() {
+        let mut watch = Watch::new();
+
+        assert_eq!(watch.observe_consent(live()), Action::Continue);
+        let action = watch.observe_consent(Ok(ConsentAnswer {
+            reason: "severed".to_string(),
+            sentence: String::new(),
+        }));
+
+        assert!(matches!(action, Action::Pause(_)));
+        assert!(watch.paused());
     }
 
     #[test]
