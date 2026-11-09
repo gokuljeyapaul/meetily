@@ -161,6 +161,7 @@ tauri-plugin-process = "2.3.0"
 aes-gcm = "0.10"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 
 # Desktop-only single instance guard
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]

@@ -24,6 +24,7 @@ use anyhow::{anyhow, Result};
 use log::info;
 
 use super::recording_state::{AudioChunk, DeviceType};
+use super::sealed_capture::{SealedTrackWriter, SessionDek, SEALED_SUFFIX};
 
 /// The alignment tolerance, in samples at the capture rate: the two devices run
 /// on independent clocks, so their sample counts drift apart over a long call.
@@ -152,6 +153,19 @@ impl TwoTrackRecorder {
         sample_rate: u32,
         mic_device: &str,
         system_device: &str,
+    ) -> Result<Self> {
+        Self::with_key(meeting_folder, sample_rate, mic_device, system_device, None)
+    }
+
+    /// The same two tracks, sealed as they are written when the engine has
+    /// issued this session's key (I2-E1-S3-T4). Without a key the tracks are
+    /// plain WAV, which only the fixture paths and upstream's tests use.
+    pub fn with_key(
+        meeting_folder: &Path,
+        sample_rate: u32,
+        mic_device: &str,
+        system_device: &str,
+        _key: Option<std::sync::Arc<SessionDek>>,
     ) -> Result<Self> {
         check_device_is_single_source("microphone", mic_device)?;
         check_device_is_single_source("system-audio", system_device)?;
@@ -435,5 +449,90 @@ mod tests {
             assert!(coach[mic_samples as usize..].iter().all(|s| *s == 0.0));
             assert!(coachee[system_samples as usize..].iter().all(|s| *s == 0.0));
         }
+    }
+}
+
+#[cfg(test)]
+mod sealed_tests {
+    use super::*;
+    use crate::audio::recording_state::{AudioChunk, DeviceType};
+    use std::sync::Arc;
+
+    fn chunk(device_type: DeviceType, data: Vec<f32>) -> AudioChunk {
+        AudioChunk {
+            data,
+            sample_rate: 48000,
+            timestamp: 0.0,
+            chunk_id: 0,
+            device_type,
+        }
+    }
+
+    #[test]
+    fn with_the_engines_key_each_track_is_sealed_as_it_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let dek = Arc::new(SessionDek::new("sess-1", &[9u8; 32]).unwrap());
+        let mut recorder = TwoTrackRecorder::with_key(
+            dir.path(),
+            48000,
+            "Built-in Microphone",
+            "BlackHole 2ch",
+            Some(dek.clone()),
+        )
+        .unwrap();
+
+        recorder
+            .write_chunk(&chunk(DeviceType::Microphone, vec![1.0, -1.0, 0.5]))
+            .unwrap();
+        recorder
+            .write_chunk(&chunk(DeviceType::System, vec![0.25]))
+            .unwrap();
+        let tracks = recorder.finish().unwrap();
+
+        assert_eq!(
+            tracks.coach.path.extension().and_then(|e| e.to_str()),
+            Some(SEALED_SUFFIX),
+            "a sealed track is not written to a .wav path"
+        );
+        let opened: Vec<u8> = crate::audio::sealed_capture::frames(&tracks.coach.path)
+            .unwrap()
+            .iter()
+            .flat_map(|frame| dek.open(frame).unwrap())
+            .collect();
+        let expected: Vec<u8> = [i16::MAX, -i16::MAX, 16383i16]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        assert_eq!(opened, expected);
+    }
+
+    #[test]
+    fn a_sealed_capture_leaves_no_plaintext_samples_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let dek = Arc::new(SessionDek::new("sess-1", &[9u8; 32]).unwrap());
+        let mut recorder = TwoTrackRecorder::with_key(
+            dir.path(),
+            48000,
+            "Built-in Microphone",
+            "BlackHole 2ch",
+            Some(dek),
+        )
+        .unwrap();
+
+        // A long run of one distinctive sample value: if any of it reached the
+        // file unsealed, the byte pattern would be there to find.
+        recorder
+            .write_chunk(&chunk(DeviceType::Microphone, vec![0.5; 4800]))
+            .unwrap();
+        let tracks = recorder.finish().unwrap();
+
+        let bytes = std::fs::read(&tracks.coach.path).unwrap();
+        let plaintext = 16383i16.to_le_bytes().repeat(32);
+        assert!(
+            !bytes.windows(plaintext.len()).any(|w| w == plaintext),
+            "plaintext PCM reached a sealed track"
+        );
+        assert_ne!(&bytes[0..4], b"RIFF", "a sealed track is not a WAV file");
+        assert!(dir.path().join("coach.wav").metadata().is_err());
     }
 }

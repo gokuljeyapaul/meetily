@@ -266,3 +266,90 @@ mod tests {
         assert_eq!(answer.sentence, "the agreement has lapsed");
     }
 }
+
+// --- I2-E1-S3-T4 — ADR-0026 option A: the key the agent seals with ---------
+
+/// What the engine issues on the DEK route: the wrap it keeps custody of, and
+/// (ADR-0026 option A, signed off) the session key itself, because a wrap this
+/// machine cannot open seals nothing.
+#[derive(Debug)]
+pub struct IssuedDek {
+    pub wrapped: String,
+    pub key: Vec<u8>,
+}
+
+impl IssuedDek {
+    /// Read the engine's answer. A missing or wrong-length key refuses: an
+    /// agent that records without one writes plaintext audio to disk.
+    pub fn read(_body: &str) -> Result<Self, AskRefused> {
+        Err(AskRefused::Unanswered("not implemented".to_string()))
+    }
+}
+
+/// Hold the session's key for this recording, and nothing longer.
+pub fn remember_session_key(_session_id: &str, _key: &[u8]) -> Result<(), AskRefused> {
+    Ok(())
+}
+
+/// The key the writer seals with, if a recording is permitted right now.
+pub fn session_key() -> Option<std::sync::Arc<super::sealed_capture::SessionDek>> {
+    None
+}
+
+/// Drop the key: stop, a pause, a discard, or any refusal.
+pub fn forget_session_key() {}
+
+#[cfg(test)]
+mod issued_key_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    #[test]
+    fn an_issued_key_is_the_thirty_two_bytes_the_sealed_writer_needs() {
+        let body = format!(
+            "{{\"wrapped_dek\":\"d2hhdGV2ZXI=\",\"dek\":\"{}\"}}",
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32])
+        );
+
+        let issued = IssuedDek::read(&body).expect("the engine issued a key");
+
+        assert_eq!(issued.wrapped, "d2hhdGV2ZXI=");
+        assert_eq!(issued.key, vec![7u8; 32]);
+    }
+
+    #[test]
+    fn an_answer_with_no_key_refuses_rather_than_recording_unsealed() {
+        let refused = IssuedDek::read("{\"wrapped_dek\":\"d2hhdGV2ZXI=\"}")
+            .expect_err("a wrap alone seals nothing");
+
+        assert!(matches!(refused, AskRefused::Unanswered(_)));
+    }
+
+    #[test]
+    fn a_key_of_the_wrong_length_refuses() {
+        let refused =
+            IssuedDek::read("{\"wrapped_dek\":\"d2hhdGV2ZXI=\",\"dek\":\"c2hvcnQ=\"}")
+                .expect_err("a short key is not a session DEK");
+
+        assert!(refused.to_string().contains("32"));
+    }
+
+    #[test]
+    fn the_key_is_held_for_the_recording_and_dropped_when_it_stops() {
+        remember_session_key("sess-1", &[3u8; 32]).expect("a 32-byte key is held");
+        let held = session_key().expect("the writer can seal while recording");
+        assert!(held.open(&held.seal(b"frame").unwrap()).unwrap() == b"frame");
+
+        forget_session_key();
+
+        assert!(session_key().is_none());
+    }
+
+    #[test]
+    fn a_key_the_sealed_writer_would_refuse_is_never_held() {
+        forget_session_key();
+
+        assert!(remember_session_key("sess-1", &[3u8; 16]).is_err());
+        assert!(session_key().is_none());
+    }
+}
