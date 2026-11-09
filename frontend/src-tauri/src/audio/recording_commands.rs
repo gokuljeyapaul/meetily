@@ -748,6 +748,10 @@ fn spawn_darpana_consent_watch<R: Runtime>(app: AppHandle<R>) {
 
             if let Action::Pause(sentence) = watch.observe_consent(answer) {
                 info!("Darpana withdrew this recording; pausing");
+                // Nothing new may be sealed under a withdrawn consent: the
+                // engine's copy of the key goes now, and the writer's own
+                // copy dies with the recorder when the recording is closed.
+                super::darpana_client::forget_session_key();
                 let _ = app.emit("darpana-recording-paused", sentence);
                 if let Err(error) = pause_recording(app.clone()).await {
                     error!("could not pause after Darpana withdrew consent: {}", error);
@@ -769,8 +773,15 @@ pub async fn stop_recording<R: Runtime>(
     // Check if recording is active
     if !IS_RECORDING.load(Ordering::SeqCst) {
         info!("Recording was not active");
+        super::darpana_client::forget_session_key();
         return Ok(());
     }
+
+    // The session key lives for one recording. Dropped here rather than at the
+    // end of the stop tail, because the writer holds its own copy until the
+    // tracks are closed and this cell is only what a *new* recording would
+    // read. It is never written to disk, logged, or emitted.
+    super::darpana_client::forget_session_key();
 
     // Emit shutdown progress to frontend
     let _ = app.emit(

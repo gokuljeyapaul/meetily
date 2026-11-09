@@ -53,6 +53,9 @@ pub struct DeviceInfo {
 /// Writes a recording as two unmixed tracks, one per device.
 pub struct RecordingSaver {
     two_track: Option<Arc<AsyncMutex<Option<TwoTrackRecorder>>>>,
+    /// Whether this recording's tracks are sealed with the session key, which
+    /// decides the names the metadata carries.
+    tracks_are_sealed: bool,
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_folder: Option<PathBuf>,
@@ -66,6 +69,7 @@ impl RecordingSaver {
     pub fn new() -> Self {
         Self {
             two_track: None,
+            tracks_are_sealed: false,
             mic_device_name: None,
             system_device_name: None,
             meeting_folder: None,
@@ -249,10 +253,25 @@ impl RecordingSaver {
         if create_checkpoints {
             let mic_device = self.mic_device_name.clone().unwrap_or_default();
             let system_device = self.system_device_name.clone().unwrap_or_default();
-            let recorder =
-                TwoTrackRecorder::new(&meeting_folder, 48000, &mic_device, &system_device)?;
+            // The key the consent gate was issued for this session, if the
+            // agent is recording under Darpana at all; frames are then sealed
+            // as they are written and no plaintext audio reaches the disk.
+            let key = super::darpana_client::session_key();
+            let sealed = key.is_some();
+            let recorder = TwoTrackRecorder::with_key(
+                &meeting_folder,
+                48000,
+                &mic_device,
+                &system_device,
+                key,
+            )?;
             self.two_track = Some(Arc::new(AsyncMutex::new(Some(recorder))));
-            info!("✅ Two unmixed tracks opened for meeting: {}", meeting_name);
+            self.tracks_are_sealed = sealed;
+            info!(
+                "✅ Two unmixed tracks opened for meeting: {} ({})",
+                meeting_name,
+                if sealed { "sealed" } else { "plain" }
+            );
         } else {
             info!("⚠️  No audio tracks opened (auto-save disabled)");
         }
@@ -269,8 +288,12 @@ impl RecordingSaver {
                 microphone: None,  // Could be enhanced to store actual device names
                 system_audio: None,
             },
-            audio_file: if create_checkpoints { "coach.wav".to_string() } else { String::new() },
-            coachee_audio_file: if create_checkpoints { "coachee.wav".to_string() } else { String::new() },
+            audio_file: track_file_name("coach.wav", create_checkpoints, self.tracks_are_sealed),
+            coachee_audio_file: track_file_name(
+                "coachee.wav",
+                create_checkpoints,
+                self.tracks_are_sealed,
+            ),
             transcript_file: "transcripts.json".to_string(),
             sample_rate: 48000,
             status: "recording".to_string(),
@@ -513,5 +536,14 @@ impl RecordingSaver {
 impl Default for RecordingSaver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// What the metadata calls a track: `coach.wav` plain, `coach.wav.enc` sealed.
+fn track_file_name(name: &str, keeping_audio: bool, sealed: bool) -> String {
+    match (keeping_audio, sealed) {
+        (false, _) => String::new(),
+        (true, false) => name.to_string(),
+        (true, true) => format!("{name}.{}", super::sealed_capture::SEALED_SUFFIX),
     }
 }

@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use super::sealed_capture::SessionDek;
 use super::session_lifecycle::{Lifecycle, Refusal};
 
 /// The header the agent's key travels in. Not a cookie: nothing a browser
@@ -139,15 +140,9 @@ impl DarpanaClient {
 
     /// The wrapped session DEK, which the engine withholds unless consent is
     /// live — so a refusal here is the engine's, not the agent's judgement.
-    pub fn session_dek(&self, session_id: &str) -> Result<String, AskRefused> {
-        #[derive(Deserialize)]
-        struct Wrapped {
-            wrapped_dek: String,
-        }
+    pub fn session_dek(&self, session_id: &str) -> Result<IssuedDek, AskRefused> {
         let body = self.get(&format!("/agent/sessions/{session_id}/dek"))?;
-        let wrapped: Wrapped = serde_json::from_str(&body)
-            .map_err(|error| AskRefused::Unanswered(error.to_string()))?;
-        Ok(wrapped.wrapped_dek)
+        IssuedDek::read(&body)
     }
 }
 
@@ -188,9 +183,17 @@ pub fn may_record(session_id: &str) -> Result<String, String> {
         .consent(session_id)
         .map_err(|refused| refused.to_string())?;
     answer.may_start().map_err(|refused| refused.to_string())?;
-    client
-        .session_dek(session_id)
-        .map_err(|refused| refused.to_string())
+    let issued = client.session_dek(session_id).map_err(|refused| {
+        forget_session_key();
+        refused.to_string()
+    })?;
+    // The key goes straight into the in-memory cell the writer reads; the
+    // caller only ever sees the wrap, so no path can log or emit the key.
+    remember_session_key(session_id, &issued.key).map_err(|refused| {
+        forget_session_key();
+        refused.to_string()
+    })?;
+    Ok(issued.wrapped)
 }
 
 #[cfg(test)]
@@ -264,5 +267,136 @@ mod tests {
 
         assert_eq!(answer.reason, "expired");
         assert_eq!(answer.sentence, "the agreement has lapsed");
+    }
+}
+
+// --- I2-E1-S3-T4 — ADR-0026 option A: the key the agent seals with ---------
+
+/// What the engine issues on the DEK route: the wrap it keeps custody of, and
+/// (ADR-0026 option A, signed off) the session key itself, because a wrap this
+/// machine cannot open seals nothing.
+#[derive(Debug)]
+pub struct IssuedDek {
+    pub wrapped: String,
+    pub key: Vec<u8>,
+}
+
+impl IssuedDek {
+    /// Read the engine's answer. A missing or wrong-length key refuses: an
+    /// agent that records without one writes plaintext audio to disk.
+    pub fn read(body: &str) -> Result<Self, AskRefused> {
+        use base64::Engine as _;
+
+        #[derive(Deserialize)]
+        struct Issued {
+            wrapped_dek: String,
+            dek: String,
+        }
+
+        let issued: Issued = serde_json::from_str(body)
+            .map_err(|error| AskRefused::Unanswered(error.to_string()))?;
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(issued.dek.as_bytes())
+            .map_err(|error| AskRefused::Unanswered(error.to_string()))?;
+        if key.len() != SESSION_DEK_BYTES {
+            return Err(AskRefused::Unanswered(format!(
+                "the engine issued {} bytes of key material and a session DEK is \
+                 {SESSION_DEK_BYTES}",
+                key.len()
+            )));
+        }
+        Ok(Self {
+            wrapped: issued.wrapped_dek,
+            key,
+        })
+    }
+}
+
+/// How long a session DEK is. Stated here so the agent refuses key material
+/// the sealed writer would reject, rather than discovering it mid-recording.
+pub const SESSION_DEK_BYTES: usize = 32;
+
+/// The session key for the recording in progress, and nowhere else.
+///
+/// It lives in this process's memory only: it is never written to disk, never
+/// logged, and never sent through a Tauri event, so the key exists only while
+/// a permitted recording is running. Stop, pause, discard and every refusal
+/// clear it, and a crash takes the process with it.
+static SESSION_KEY: std::sync::Mutex<Option<std::sync::Arc<SessionDek>>> =
+    std::sync::Mutex::new(None);
+
+/// Hold the session's key for this recording, and nothing longer.
+pub fn remember_session_key(session_id: &str, key: &[u8]) -> Result<(), AskRefused> {
+    let dek = SessionDek::new(session_id, key)
+        .map_err(|error| AskRefused::Unanswered(error.to_string()))?;
+    *SESSION_KEY.lock().expect("the key cell is not poisoned") = Some(std::sync::Arc::new(dek));
+    Ok(())
+}
+
+/// The key the writer seals with, if a recording is permitted right now.
+pub fn session_key() -> Option<std::sync::Arc<SessionDek>> {
+    SESSION_KEY
+        .lock()
+        .expect("the key cell is not poisoned")
+        .clone()
+}
+
+/// Drop the key: stop, a pause, a discard, or any refusal.
+pub fn forget_session_key() {
+    *SESSION_KEY.lock().expect("the key cell is not poisoned") = None;
+}
+
+#[cfg(test)]
+mod issued_key_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    #[test]
+    fn an_issued_key_is_the_thirty_two_bytes_the_sealed_writer_needs() {
+        let body = format!(
+            "{{\"wrapped_dek\":\"d2hhdGV2ZXI=\",\"dek\":\"{}\"}}",
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32])
+        );
+
+        let issued = IssuedDek::read(&body).expect("the engine issued a key");
+
+        assert_eq!(issued.wrapped, "d2hhdGV2ZXI=");
+        assert_eq!(issued.key, vec![7u8; 32]);
+    }
+
+    #[test]
+    fn an_answer_with_no_key_refuses_rather_than_recording_unsealed() {
+        let refused = IssuedDek::read("{\"wrapped_dek\":\"d2hhdGV2ZXI=\"}")
+            .expect_err("a wrap alone seals nothing");
+
+        assert!(matches!(refused, AskRefused::Unanswered(_)));
+    }
+
+    #[test]
+    fn a_key_of_the_wrong_length_refuses() {
+        let refused =
+            IssuedDek::read("{\"wrapped_dek\":\"d2hhdGV2ZXI=\",\"dek\":\"c2hvcnQ=\"}")
+                .expect_err("a short key is not a session DEK");
+
+        assert!(refused.to_string().contains("32"));
+    }
+
+    #[test]
+    fn the_key_is_held_for_the_recording_and_dropped_when_it_stops() {
+        remember_session_key("sess-1", &[3u8; 32]).expect("a 32-byte key is held");
+        let held = session_key().expect("the writer can seal while recording");
+        assert!(held.open(&held.seal(b"frame").unwrap()).unwrap() == b"frame");
+
+        forget_session_key();
+
+        assert!(session_key().is_none());
+    }
+
+    #[test]
+    fn a_key_the_sealed_writer_would_refuse_is_never_held() {
+        forget_session_key();
+
+        assert!(remember_session_key("sess-1", &[3u8; 16]).is_err());
+        assert!(session_key().is_none());
     }
 }
