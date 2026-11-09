@@ -19,6 +19,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use log::info;
@@ -60,58 +61,129 @@ pub fn check_device_is_single_source(role: &str, device_name: &str) -> Result<()
     Ok(())
 }
 
+/// Where one track's bytes go: a plain WAV file, or frames sealed with the
+/// session key as they are written.
+///
+/// The sealed variant is not a WAV file at all: a WAV declares its length in a
+/// header that has to be rewritten at the end, and a sealed track cannot be
+/// seeked back into without decrypting what is already there. The engine reads
+/// the frames and the sample rate from the recording's metadata instead.
+enum TrackSink {
+    Plain(BufWriter<File>),
+    Sealed {
+        writer: SealedTrackWriter,
+        dek: Arc<SessionDek>,
+    },
+}
+
+/// Deliberately hand-written: a derived `Debug` would print the session key
+/// the moment anything logged a recorder.
+impl std::fmt::Debug for TrackSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Plain(_) => f.write_str("plain"),
+            Self::Sealed { .. } => f.write_str("sealed"),
+        }
+    }
+}
+
 /// One track: one device, one file, its own sample clock.
 #[derive(Debug)]
 struct TrackWriter {
     path: PathBuf,
-    file: BufWriter<File>,
+    sink: TrackSink,
     device_name: String,
     samples_written: u64,
 }
 
 impl TrackWriter {
-    fn create(path: PathBuf, device_name: String, sample_rate: u32) -> Result<Self> {
-        let mut file = BufWriter::new(File::create(&path)?);
-        write_wav_header(&mut file, sample_rate, 0)?;
+    fn create(
+        path: PathBuf,
+        device_name: String,
+        sample_rate: u32,
+        dek: Option<Arc<SessionDek>>,
+    ) -> Result<Self> {
+        let (path, sink) = match dek {
+            Some(dek) => {
+                let sealed_path = sealed_path(&path);
+                let writer = SealedTrackWriter::create(&sealed_path)?;
+                (sealed_path, TrackSink::Sealed { writer, dek })
+            }
+            None => {
+                let mut file = BufWriter::new(File::create(&path)?);
+                write_wav_header(&mut file, sample_rate, 0)?;
+                (path, TrackSink::Plain(file))
+            }
+        };
         Ok(Self {
             path,
-            file,
+            sink,
             device_name,
             samples_written: 0,
         })
     }
 
     fn write(&mut self, samples: &[f32]) -> Result<()> {
+        let mut pcm = Vec::with_capacity(samples.len() * 2);
         for sample in samples {
             let clamped = sample.clamp(-1.0, 1.0);
-            let pcm = (clamped * i16::MAX as f32) as i16;
-            self.file.write_all(&pcm.to_le_bytes())?;
+            pcm.extend_from_slice(&((clamped * i16::MAX as f32) as i16).to_le_bytes());
         }
+        self.write_pcm(&pcm)?;
         self.samples_written += samples.len() as u64;
         Ok(())
     }
 
-    fn pad_silence(&mut self, samples: u64) -> Result<()> {
-        let silence = [0u8; 2];
-        for _ in 0..samples {
-            self.file.write_all(&silence)?;
+    /// One chunk of samples becomes one frame: a sealed track is written and
+    /// flushed frame by frame, so whatever was captured is either sealed on
+    /// disk or was never captured at all.
+    fn write_pcm(&mut self, pcm: &[u8]) -> Result<()> {
+        match &mut self.sink {
+            TrackSink::Plain(file) => file.write_all(pcm)?,
+            TrackSink::Sealed { writer, dek } => writer.write(dek, pcm)?,
         }
+        Ok(())
+    }
+
+    fn pad_silence(&mut self, samples: u64) -> Result<()> {
+        let count = usize::try_from(samples).map_err(|_| anyhow!("that is not a drift"))?;
+        self.write_pcm(&vec![0u8; count * 2])?;
         self.samples_written += samples;
         Ok(())
     }
 
-    fn finalize(mut self, sample_rate: u32) -> Result<TrackResult> {
-        self.file.flush()?;
-        let mut file = self.file.into_inner()?;
-        file.seek(SeekFrom::Start(0))?;
-        write_wav_header(&mut file, sample_rate, self.samples_written)?;
-        file.flush()?;
+    fn finalize(self, sample_rate: u32) -> Result<TrackResult> {
+        let Self {
+            path,
+            sink,
+            device_name,
+            samples_written,
+        } = self;
+        match sink {
+            TrackSink::Plain(file) => {
+                let mut file = file.into_inner()?;
+                file.seek(SeekFrom::Start(0))?;
+                write_wav_header(&mut file, sample_rate, samples_written)?;
+                file.flush()?;
+            }
+            // Every frame was already flushed as it was sealed, and there is
+            // no header to go back and correct.
+            TrackSink::Sealed { .. } => {}
+        }
         Ok(TrackResult {
-            path: self.path,
-            device_name: self.device_name,
-            samples: self.samples_written,
+            path,
+            device_name,
+            samples: samples_written,
         })
     }
+}
+
+/// `coach.wav` sealed is `coach.wav.enc`: the track it came from stays legible
+/// in the name, and the sealed reader refuses anything not ending `.enc`.
+fn sealed_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{SEALED_SUFFIX}"));
+    path.with_file_name(name)
 }
 
 /// What one finished track is, for the metadata the engine reads.
@@ -165,7 +237,7 @@ impl TwoTrackRecorder {
         sample_rate: u32,
         mic_device: &str,
         system_device: &str,
-        _key: Option<std::sync::Arc<SessionDek>>,
+        key: Option<Arc<SessionDek>>,
     ) -> Result<Self> {
         check_device_is_single_source("microphone", mic_device)?;
         check_device_is_single_source("system-audio", system_device)?;
@@ -174,11 +246,13 @@ impl TwoTrackRecorder {
             meeting_folder.join("coach.wav"),
             mic_device.to_string(),
             sample_rate,
+            key.clone(),
         )?;
         let coachee = TrackWriter::create(
             meeting_folder.join("coachee.wav"),
             system_device.to_string(),
             sample_rate,
+            key,
         )?;
 
         info!(
